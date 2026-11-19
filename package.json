@@ -1,0 +1,17 @@
+{
+  "name": "github-repo-telegram-bot",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Личный Telegram-помощник по GitHub-репозиториям",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node test/run.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "setup:gemini": "node scripts/setup-gemini.mjs",
+    "setup:grok": "node scripts/setup-provider.mjs xai",
+    "setup:groq": "node scripts/setup-provider.mjs groq",
+    "check:gemini": "node scripts/check-gemini.mjs"
+  }
+}
