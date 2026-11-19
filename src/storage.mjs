@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { parseAccount } from './github.mjs';
 import { mkdir, readFile, writeFile, rename, unlink } from 'node:fs/promises';
 
 export async function writeJson(path, value) {
@@ -14,6 +15,21 @@ export async function readState(path) {
     const state = JSON.parse(await readFile(path, 'utf8'));
     if (!Number.isSafeInteger(state.offset) || state.offset < 0 || !state.selected || typeof state.selected !== 'object' || Array.isArray(state.selected)
       || Object.entries(state.selected).some(([id, name]) => !/^\d+$/.test(id) || typeof name !== 'string')) throw new Error('invalid');
+    if (state.githubAccounts !== undefined) {
+      const accounts = state.githubAccounts;
+      if (!accounts || typeof accounts !== 'object' || Array.isArray(accounts)
+        || Object.entries(accounts).some(([id, login]) => !/^\d+$/.test(id) || typeof login !== 'string' || parseAccount(login) !== login)) throw new Error('invalid');
+    }
+    if (state.usage !== undefined) {
+      if (!state.usage || typeof state.usage !== 'object' || Array.isArray(state.usage)) throw new Error('invalid');
+      for (const [id, entry] of Object.entries(state.usage)) {
+        if (!/^\d+$/.test(id) || !entry || typeof entry !== 'object' || Array.isArray(entry)
+          || typeof entry.day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.day)
+          || !Number.isFinite(Date.parse(entry.day + 'T00:00:00Z')) || new Date(entry.day + 'T00:00:00Z').toISOString().slice(0, 10) !== entry.day
+          || !Number.isSafeInteger(entry.questions) || entry.questions < 0
+          || !Number.isSafeInteger(entry.indexes) || entry.indexes < 0) throw new Error('invalid');
+      }
+    }
     return state;
   } catch (error) {
     if (error.code === 'ENOENT') return { offset: 0, selected: {} };

@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises';
+﻿import { mkdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.mjs';
@@ -44,9 +44,10 @@ export async function runBot({ root = new URL('../', import.meta.url), env = pro
         }
       }
     }
-    const bot = new Bot({ config, github: new GitHub(config, fetcher), localProject: new LocalProject(root, config.maxFiles), assistant: new Assistant(config, fetcher, logger), send,
-      cache: new SnapshotStore(new URL('indexes/', dataDir), config.maxFiles), state: disk.selected,
-      save: async selected => { const next = { ...disk, selected }; await writeJson(statePath, next); disk = next; } });
+    const bot = new Bot({ config, github: new GitHub(config, fetcher), publicGithub: new GitHub({ ...config, githubToken: '' }, fetcher), localProject: new LocalProject(root, config.maxFiles), assistant: new Assistant(config, fetcher, logger), send,
+      cache: new SnapshotStore(new URL('indexes/', dataDir), config.maxFiles), state: disk.selected, githubAccounts: disk.githubAccounts, usage: disk.usage,
+      saveUsage: async usage => { const next = { ...disk, usage }; await writeJson(statePath, next); disk = next; },
+      save: async (selected, githubAccounts) => { const next = { ...disk, selected, ...(githubAccounts === undefined ? {} : { githubAccounts }) }; await writeJson(statePath, next); disk = next; } });
     await bot.restore();
     let me;
     while (!signal.aborted) {
@@ -69,7 +70,7 @@ export async function runBot({ root = new URL('../', import.meta.url), env = pro
     logger.log(`Бот @${me.username} запущен. Остановка: Ctrl+C.`);
     logger.log(bot.mode());
     logger.log(`Восстановлено индексов: ${bot.sessions.size}.`);
-    if (!config.allowedIds.size) logger.log('Доступ закрыт. Отправь боту /id, внеси ID в .env и перезапусти.');
+    if (!config.publicAccess && !config.allowedIds.size) logger.log('Доступ закрыт. Отправь боту /id, внеси ID в .env и перезапусти.');
     while (!signal.aborted) {
       try {
         const updates = await telegram('getUpdates', { offset: disk.offset, timeout: 25, allowed_updates: ['message'] }, signal);

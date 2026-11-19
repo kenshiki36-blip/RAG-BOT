@@ -7,7 +7,7 @@ import { setImmediate } from 'node:timers/promises';
 import { PassThrough } from 'node:stream';
 import { spawnSync } from 'node:child_process';
 import { parseEnv, loadConfig } from '../src/config.mjs';
-import { GitHub, safePath, redact, parseRepo } from '../src/github.mjs';
+import { GitHub, safePath, redact, parseRepo, parseAccount } from '../src/github.mjs';
 import { retrieve } from '../src/retrieval.mjs';
 import { Assistant } from '../src/ai.mjs';
 import { Bot, splitMessage } from '../src/bot.mjs';
@@ -15,6 +15,7 @@ import { jsonRequest, textRequest } from '../src/http.mjs';
 import { SnapshotStore, readState, writeJson } from '../src/storage.mjs';
 import { acquireLock, isRunning } from '../src/lock.mjs';
 import { runBot } from '../src/main.mjs';
+import { approvedPath, auditFiles, readPublication } from '../scripts/publish-github.mjs';
 import { saveGeminiKey, readSecret } from '../scripts/setup-gemini.mjs';
 import { LocalProject } from '../src/local-project.mjs';
 import { createRuntimeLogger } from '../src/logging.mjs';
@@ -49,6 +50,11 @@ export async function runTests() {
     assert.equal(redact('password=supersecret\ncode=ok'), 'password=[REDACTED]\ncode=ok');
     assert.ok(!redact('ghp_123456789012345678901234').includes('ghp_'));
     assert.ok(!redact('AIza' + 'a'.repeat(35)).includes('AIza'));
+    for (const secret of ['DB_PASSWORD=my.pass.word', 'API_KEY=abc def', 'password: hunter2', '"password": "abc123",', "const secret = 'xyz'", 'token_secret = 9f8e7d6c5b4a'])
+      assert.ok(redact(secret).includes('[REDACTED]') && !/my\.pass|abc def|hunter2|abc123|xyz|9f8e7d/.test(redact(secret)), secret);
+    for (const code of ['const password = req.body.password', 'if (secret === undefined) return login(token)', 'apiKey: process.env.KEY, model: x',
+      'password = getpass()', 'client_secret = os.environ["X"]', '  password: string;', 'const fn = (password) => check(password)'])
+      assert.equal(redact(code), code);
   });
   const snapshot = { name: 'me/project', sha: 'abc123', branch: 'main', tree: ['README.md', 'src/auth.js'], commits: [], warnings: [], files: [
     { path: 'README.md', text: '# Project\nInstall\nnpm start', url: 'https://github.com/me/project/blob/abc123/README.md' },
@@ -477,6 +483,282 @@ export async function runTests() {
       assert.match(await ai.ask(snapshot, 'How to start?'), /answer/);
     }
   });
+  await check('Public access isolates credentials, local files and private snapshots', async () => {
+    const replies = [];
+    let privateCalls = 0, publicCalls = 0, localCalls = 0;
+    const bot = new Bot({
+      config: { ...config, publicAccess: true },
+      github: { repos: async () => { privateCalls++; return []; }, snapshot: async () => { privateCalls++; return snapshot; } },
+      publicGithub: {
+        repos: async () => [{full_name:'me/public',private:false,html_url:'https://github.com/me/public'}, {full_name:'me/secret',private:true}],
+        snapshot: async () => { publicCalls++; return {...snapshot,source:'github',isPublic:true}; }
+      },
+      localProject: {name:'local/project',snapshot:async()=>{localCalls++;return snapshot;}},
+      assistant: {ask:async()=> 'Public answer'},
+      send: async (id,text)=>replies.push(text)
+    });
+    await bot.handle(message('/start',2));
+    assert.ok(!replies.at(-1).includes('/local'));
+    await bot.handle(message('/repos',2));
+    assert.ok(replies.at(-1).includes('me/public'));
+    assert.ok(!replies.at(-1).includes('me/secret'));
+    await bot.handle(message('/local',2));
+    assert.equal(localCalls,0);
+    await bot.handle(message('/repo project',2));
+    await bot.handle(message('Explain project',2));
+    assert.equal(replies.at(-1),'Public answer');
+    assert.equal(privateCalls,0); assert.equal(publicCalls,1);
+    assert.equal(bot.sessions.has('1'),false);
+    bot.publicGithub.snapshot = async()=>({...snapshot,source:'github',isPublic:false});
+    await bot.handle(message('/repo secret',3));
+    assert.equal(bot.sessions.has('3'),false);
+    bot.state['3']='local/project';
+    await bot.handle(message('/refresh',3));
+    assert.equal(localCalls,0);
+    bot.sessions.set('4',{snapshot:{...snapshot,source:'local'},history:[]});
+    await bot.handle(message('/file README.md',4));
+    assert.ok(!replies.at(-1).includes('# Project'));
+  });
+
+  await check('Public users have daily AI and indexing limits; the owner does not', async () => {
+    const replies = []; let asks = 0, snapshots = 0;
+    const bot = new Bot({
+      config: { ...config, publicAccess: true, publicDailyQuestions: 2, publicDailyIndexes: 1 },
+      github: { repos: async () => [], snapshot: async () => { snapshots++; return { ...snapshot, source: 'github', isPublic: true }; } },
+      publicGithub: { repos: async () => [], snapshot: async () => { snapshots++; return { ...snapshot, source: 'github', isPublic: true }; } },
+      assistant: { ask: async () => { asks++; return 'AI answer'; } },
+      send: async (id, text) => replies.push(text)
+    });
+    await bot.handle(message('/repo project', 2));
+    await bot.handle(message('/refresh', 2));
+    assert.equal(snapshots, 1); assert.match(replies.at(-1), /лимит загрузки/);
+    for (let i = 0; i < 3; i++) await bot.handle(message('Explain project', 2));
+    assert.equal(asks, 2); assert.match(replies.at(-1), /лимит вопросов/);
+    await bot.handle(message('/search login', 2));
+    assert.ok(!/лимит/.test(replies.at(-1)));
+    await bot.handle(message('/repo project', 1)); await bot.handle(message('/refresh', 1));
+    for (let i = 0; i < 3; i++) await bot.handle(message('Explain project', 1));
+    assert.equal(snapshots, 3); assert.equal(asks, 5);
+    bot.usage.get('2').day = '2000-01-01';
+    await bot.handle(message('Explain project', 2));
+    assert.equal(asks, 6);
+    const missingEnv = pathToFileURL(join(tmpdir(), `repo-bot-missing-${Date.now()}`, '.env'));
+    await assert.rejects(loadConfig({ TELEGRAM_BOT_TOKEN: 'x', PUBLIC_DAILY_QUESTIONS: '-1' }, missingEnv), /PUBLIC_DAILY_QUESTIONS/);
+    const defaults = await loadConfig({ TELEGRAM_BOT_TOKEN: 'x' }, missingEnv);
+    assert.equal(defaults.publicDailyQuestions, 20); assert.equal(defaults.publicDailyIndexes, 5);
+  });
+  await check('GitHub account parser accepts profiles and rejects paths, credentials and tokens', () => {
+    for (const [value, login] of [['alice','alice'], ['@alice','alice'], ['https://github.com/Alice/','Alice'], ['https://github.com/alice?tab=repositories','alice']]) assert.equal(parseAccount(value), login);
+    for (const value of ['','-alice','alice-','a'.repeat(40),'alice/project','https://evil.test/alice','https://github.com@evil.test/alice','https://user:pass@github.com/alice','https://github.com:8443/alice','ghp_'+'x'.repeat(30)]) assert.throws(() => parseAccount(value));
+  });
+  await check('Personal GitHub selection, repositories and histories are isolated by Telegram user', async () => {
+    const replies = [], asked = [], listed = [], indexed = [];
+    let savedAccounts = {}, savedSelected = {}, privateCalls = 0;
+    const bot = new Bot({
+      config: {...config, publicAccess:true},
+      github: {repos:async()=>{privateCalls++;return[];},snapshot:async()=>{privateCalls++;return snapshot;}},
+      publicGithub: {
+        profile: async login=>({login,type:'User'}),
+        repos:async login=>{listed.push(login);return [{full_name:login+'/project',private:false,html_url:'https://github.com/'+login+'/project'}, {full_name:login+'/secret',private:true}];},
+        snapshot:async name=>{indexed.push(name);return {...snapshot,name,source:'github',isPublic:true};}
+      },
+      assistant:{ask:async(s,text,history)=>{asked.push({name:s.name,history:history.map(x=>({...x}))});return s.name;}},
+      send:async(id,text)=>replies.push({id,text}),
+      save:async(selected,accounts)=>{savedSelected={...selected};if(accounts!==undefined)savedAccounts={...accounts};}
+    });
+    await bot.handle(message('/github alice',2));
+    await bot.handle(message('/github https://github.com/bob',3));
+    await bot.handle(message('/repos',2)); assert.match(replies.at(-1).text,/alice\/project/); assert.ok(!replies.at(-1).text.includes('secret'));
+    await bot.handle(message('/repos',3)); assert.match(replies.at(-1).text,/bob\/project/);
+    assert.deepEqual(listed,['alice','bob']);
+    await bot.handle(message('/repo project',2)); await bot.handle(message('/repo project',3));
+    assert.deepEqual(indexed,['alice/project','bob/project']);
+    await bot.handle(message('Question Alice',2)); await bot.handle(message('Question Bob',3)); await bot.handle(message('Follow-up Alice',2));
+    assert.equal(asked[0].history.length,0); assert.equal(asked[1].history.length,0); assert.equal(asked[2].history.length,2);
+    assert.equal(asked[2].history[0].content,'Question Alice');
+    assert.equal(bot.sessions.get('3').history[0].content,'Question Bob');
+    await bot.handle(message('/github charlie',2));
+    assert.equal(bot.sessions.has('2'),false); assert.equal(bot.sessions.has('3'),true);
+    assert.equal(savedSelected['2'],undefined); assert.equal(savedSelected['3'],'bob/project');
+    assert.deepEqual(savedAccounts,{'2':'charlie','3':'bob'});
+    await bot.handle(message('/repo https://github.com/bob/other',2));
+    assert.equal(indexed.at(-1),'bob/other'); assert.equal(bot.account('2'),'charlie');
+    await bot.handle(message('/disconnect',2));
+    assert.deepEqual(savedAccounts,{'3':'bob'}); assert.equal(bot.sessions.has('3'),true); assert.equal(bot.sessions.has('2'),false);
+    assert.equal(privateCalls,0);
+    await bot.handle(message('/repo alice/project'));
+    assert.equal(indexed.at(-1),'alice/project'); assert.equal(privateCalls,0);
+  });
+  await check('Invalid accounts and failed account saves preserve the working project and history', async () => {
+    const replies = []; let lookups = 0, saves = 0;
+    const bot = new Bot({
+      config:{...config,publicAccess:true}, githubAccounts:{'2':'alice'},state:{'2':'alice/project'},
+      publicGithub:{profile:async login=>{lookups++;if(login==='missing')throw new Error('GitHub: HTTP 404');return {login};}},
+      send:async(id,text)=>replies.push(text),save:async()=>{saves++;throw new Error('disk unavailable');}
+    });
+    const session={snapshot:{...snapshot,name:'alice/project',source:'github',isPublic:true},history:[{role:'user',content:'keep'}]};
+    bot.sessions.set('2',session);
+    await bot.handle(message('/github https://evil.test/alice',2));
+    assert.equal(lookups,0);assert.equal(saves,0);
+    await bot.handle(message('/github missing',2));assert.equal(saves,0);
+    await bot.handle(message('/github bob',2));assert.equal(saves,1);
+    assert.equal(bot.account('2'),'alice');assert.equal(bot.state['2'],'alice/project');assert.equal(bot.sessions.get('2'),session);
+    await bot.handle(message('/disconnect',2));assert.equal(bot.account('2'),'alice');assert.equal(bot.sessions.get('2'),session);
+    assert.match(replies.at(-1),/disk unavailable/);
+  });
+  await check('Owner credentials are never used for another account or profile lookup', async () => {
+    const requests=[];
+    const github=new GitHub({...config,githubToken:'owner-secret'},async(url,options)=>{
+      const target=new URL(url); requests.push(target.pathname);
+      assert.equal(options.headers.Authorization,undefined);
+      let payload;
+      if(target.pathname==='/users/alice')payload={login:'Alice',type:'User'};
+      else if(target.pathname==='/users/alice/repos')payload=[{owner:{login:'alice'},private:false,full_name:'alice/project'}];
+      else if(target.pathname==='/repos/alice/project')payload={private:false,default_branch:'main'};
+      else if(target.pathname.endsWith('/commits/main'))return new Response('{}',{status:409});
+      else throw new Error('Unexpected public path: '+target.pathname);
+      return new Response(JSON.stringify(payload));
+    });
+    assert.deepEqual(await github.profile('alice'),{login:'Alice',type:'User'});
+    assert.equal((await github.repos('alice'))[0].full_name,'alice/project');
+    assert.equal((await github.snapshot('alice/project')).isPublic,true);
+    assert.equal(requests.length,4);
+    const malformed=new GitHub(config,async()=>new Response(JSON.stringify({login:'other-user',type:'User'})));
+    await assert.rejects(malformed.profile('alice'),/GitHub/);
+  });
+  await check('State migration keeps existing users and validates saved personal GitHub accounts', async () => inTemp(async root=>{
+    const path=new URL('state.json',root),legacy={offset:8,selected:{'1':'me/project'}};
+    await writeJson(path,legacy);assert.deepEqual(await readState(path),legacy);
+    const current={...legacy,githubAccounts:{'2':'Alice'}};
+    await writeJson(path,current);assert.deepEqual(await readState(path),current);
+    for(const githubAccounts of [null,[],{'2':'https://github.com/alice'},{bad:'alice'},{'2':7},{'2':'../private'}]){
+      const raw=JSON.stringify({...legacy,githubAccounts});
+      await writeFile(path,raw);await assert.rejects(readState(path),/state.json/);assert.equal(await readFile(path,'utf8'),raw);
+    }
+  }));
+  await check('Public GitHub connections survive polling restart without sharing owner credentials', async () => inTemp(async root=>{
+    const sent=[],requests=[];let menu=false;
+    const launch=async updates=>{
+      const controller=new AbortController();let polls=0;
+      await runBot({root,env:{TELEGRAM_BOT_TOKEN:'test',ALLOWED_TELEGRAM_IDS:'1',GITHUB_OWNER:'me',GITHUB_TOKEN:'owner-secret',PUBLIC_ACCESS:'true',PUBLIC_DAILY_INDEXES:'2'},
+        signal:AbortSignal.any([controller.signal,AbortSignal.timeout(5000)]),pause:async()=>setImmediate(),
+        logger:{log(){},warn(){},error(error){throw new Error(error);}},
+        fetcher:async(url,options)=>{
+          const target=new URL(url);
+          if(target.hostname==='api.telegram.org'){
+            const method=target.pathname.split('/').at(-1),body=JSON.parse(options.body);let result=true;
+            if(method==='getMe')result={username:'testbot'};
+            else if(method==='getWebhookInfo')result={url:''};
+            else if(method==='setMyCommands'){menu=body.commands.some(x=>x.command==='github')&&body.commands.some(x=>x.command==='disconnect');}
+            else if(method==='sendMessage')sent.push({id:body.chat_id,text:body.text});
+            else if(method==='getUpdates'){if(++polls===1)result=updates;else{controller.abort();result=[];}}
+            return new Response(JSON.stringify({ok:true,result}));
+          }
+          assert.equal(options.headers?.Authorization,undefined);requests.push(target.pathname);
+          if(target.hostname==='raw.githubusercontent.com')return new Response('# Public project\nnpm start');
+          let data;
+          if(/^\/users\/(alice|bob)$/.test(target.pathname))data={login:target.pathname.split('/')[2],type:'User'};
+          else if(/^\/users\/(alice|bob)\/repos$/.test(target.pathname)){const login=target.pathname.split('/')[2];data=[{owner:{login},full_name:login+'/project',private:false,html_url:'https://github.com/'+login+'/project'}];}
+          else if(/^\/repos\/(alice|bob)\/project$/.test(target.pathname))data={default_branch:'main',private:false};
+          else if(target.pathname.endsWith('/commits/main'))data={sha:'abc123',commit:{tree:{sha:'tree123'}}};
+          else if(target.pathname.includes('/git/trees/'))data={tree:[{type:'blob',mode:'100644',path:'README.md',size:30,sha:'blob123'}]};
+          else if(target.pathname.endsWith('/commits'))data=[];
+          else throw new Error('Unexpected GitHub path '+target.pathname);
+          return new Response(JSON.stringify(data));
+        }});
+    };
+    await launch([
+      {update_id:10,message:message('/github alice',2)},{update_id:11,message:message('/github bob',3)},
+      {update_id:12,message:message('/repo project',2)},{update_id:13,message:message('/repo project',3)}
+    ]);
+    assert.ok(menu);
+    const first=await readState(new URL('data/state.json',root));
+    const day=new Date().toISOString().slice(0,10);
+    assert.deepEqual(first,{offset:14,selected:{'2':'alice/project','3':'bob/project'},githubAccounts:{'2':'alice','3':'bob'},usage:{'2':{day,questions:0,indexes:1},'3':{day,questions:0,indexes:1}}});
+    const count=requests.filter(p=>p==='/repos/alice/project').length;
+    await launch([{update_id:14,message:message('/github',2)},{update_id:15,message:message('/repos',3)},{update_id:16,message:message('/refresh',2)}]);
+    assert.ok(sent.some(x=>x.id===2&&x.text.includes('GitHub для /repos: alice')));
+    assert.ok(sent.some(x=>x.id===3&&x.text.includes('bob/project')));
+    assert.equal(requests.filter(p=>p==='/repos/alice/project').length,count+1);
+    const second=await readState(new URL('data/state.json',root));
+    assert.deepEqual(second.githubAccounts,first.githubAccounts);assert.deepEqual(second.selected,first.selected);assert.equal(second.offset,17);
+    assert.equal(second.usage['2'].indexes,2);
+    const before=requests.filter(p=>p==='/repos/alice/project').length;
+    await launch([{update_id:17,message:message('/repo project',2)},{update_id:18,message:message('/refresh',2)}]);
+    assert.equal(requests.filter(p=>p==='/repos/alice/project').length,before);
+    assert.equal((await readState(new URL('data/state.json',root))).usage['2'].indexes,2);
+  }));
+
+  await check('Daily quota survives restart and disconnect, resets at UTC midnight and exempts owners', async () => {
+    let saved={},day='2026-11-19',writes=0;
+    const options={config:{...config,publicAccess:true,publicDailyQuestions:2,publicDailyIndexes:1},
+      saveUsage:async value=>{saved=structuredClone(value);writes++;},now:()=>new Date(day+'T23:59:59Z')};
+    const first=new Bot(options);
+    await first.spend('2','questions');await first.spend('2','questions');await first.spend('2','indexes');
+    assert.deepEqual(saved['2'],{day,questions:2,indexes:1});
+    const restored=new Bot({...options,usage:saved});
+    await assert.rejects(restored.spend('2','questions'));
+    await assert.rejects(restored.spend('2','indexes'));
+    await restored.setAccount('2',null);
+    await assert.rejects(restored.spend('2','questions'));
+    await restored.spend('3','questions');assert.equal(saved['3'].questions,1);
+    const before=writes;
+    await restored.spend('1','questions');await restored.spend('1','indexes');assert.equal(writes,before);assert.equal(saved['1'],undefined);
+    day='2026-11-20';
+    await restored.spend('2','questions');assert.deepEqual(saved,{'2':{day,questions:1,indexes:0}});
+    const original={day,questions:1,indexes:0};
+    const isolated=new Bot({...options,usage:{'2':original}});
+    await isolated.spend('2','questions');assert.equal(original.questions,1);
+  });
+  await check('Quota persistence fails closed before GitHub and AI without changing live usage', async () => {
+    let indexed=0,asked=0;const replies=[];
+    const bot=new Bot({config:{...config,publicAccess:true},
+      publicGithub:{snapshot:async()=>{indexed++;return {...snapshot,source:'github',isPublic:true};}},
+      assistant:{ask:async()=>{asked++;return 'answer';}},send:async(id,text)=>replies.push(text),
+      saveUsage:async()=>{throw new Error('quota storage unavailable');}});
+    bot.sessions.set('2',{snapshot:{...snapshot,source:'github',isPublic:true},history:[]});
+    await bot.handle(message('/repo project',2));await bot.handle(message('Explain project',2));
+    assert.equal(indexed,0);assert.equal(asked,0);assert.equal(bot.usage.size,0);
+    assert.ok(replies.every(text=>text.includes('quota storage unavailable')));
+  });
+  await check('State validates quota entries and preserves corrupted quota files', async()=>inTemp(async root=>{
+    const path=new URL('state.json',root),legacy={offset:1,selected:{}};
+    await writeJson(path,legacy);assert.deepEqual(await readState(path),legacy);
+    const entry={day:'2026-11-19',questions:2,indexes:1};
+    await writeJson(path,{...legacy,usage:{'2':entry}});
+    assert.deepEqual((await readState(path)).usage,{'2':entry});
+    for(const usage of [null,[],{bad:entry},{'2':{...entry,questions:-1}},{'2':{...entry,questions:1.5}},
+      {'2':{...entry,indexes:'1'}},{'2':{...entry,day:'2026-02-30'}},{'2':{...entry,day:'invalid'}}]){
+      const text=JSON.stringify({...legacy,usage});await writeFile(path,text);
+      await assert.rejects(readState(path));assert.equal(await readFile(path,'utf8'),text);
+    }
+  }));
+
+  await check('Publication rejects secrets and private paths while allowing the documented dummy fixture', async()=>{
+    for(const path of ['.env','data/state.json','PROGRESS.md','src/../.env','src/.git/config'])assert.equal(approvedPath(path),false);
+    assert.equal(approvedPath('.env.example'),true);assert.equal(approvedPath('src/bot.mjs'),true);
+    const file=(path,source)=>({path,bytes:Buffer.from(source,'utf8')});
+    const key='xai-'+'p'.repeat(32);
+    assert.throws(()=>auditFiles([file('src/main.mjs','const key="'+key+'";')]),error=>error.message.includes('credential')&&!error.message.includes(key));
+    assert.throws(()=>auditFiles([file('README.md','private-value')],['private-value']));
+    assert.throws(()=>auditFiles([file('PROGRESS.md','# Internal notes')]));
+    auditFiles([file('test/run.mjs','ghp_'+'123456789012345678901234')]);
+  });
+  await check('Publication reads fresh UTF-8 source and excludes runtime files and internal notes',async()=>inTemp(async root=>{
+    await mkdir(new URL('src/',root));await mkdir(new URL('data/',root));
+    await writeFile(new URL('README.md',root),'# Safe source','utf8');
+    await writeFile(new URL('src/main.mjs',root),'export const version=1;','utf8');
+    await writeFile(new URL('.env',root),'TELEGRAM_BOT_TOKEN=private-local-value','utf8');
+    await writeFile(new URL('PROGRESS.md',root),'private-local-value','utf8');
+    await writeFile(new URL('data/state.json',root),'private-local-value','utf8');
+    const first=await readPublication(root);
+    assert.deepEqual(first.files.map(x=>x.path),['README.md','src/main.mjs']);
+    await writeFile(new URL('src/main.mjs',root),'export const version=2;','utf8');
+    const second=await readPublication(root);
+    assert.notEqual(second.files.find(x=>x.path==='src/main.mjs').sha256,first.files.find(x=>x.path==='src/main.mjs').sha256);
+    await writeFile(new URL('src/main.mjs',root),Buffer.from([0xff]));
+    await assert.rejects(readPublication(root));
+  }));
   return { passed };
 }
 

@@ -21,7 +21,45 @@ export function redact(text) {
     .replace(/\b(?:gsk_[A-Za-z0-9_-]{16,}|xai-[A-Za-z0-9_-]{16,})\b/g, '[AI KEY REMOVED]')
     .replace(/\bAQ[A-Za-z0-9_-]{50}\b/g, '[MALFORMED GOOGLE AUTH KEY REMOVED]')
     .replace(/\b\d{6,}:[A-Za-z0-9_-]{25,}\b/g, '[TELEGRAM TOKEN REMOVED]')
-    .replace(/((?:api[_-]?key|access[_-]?token|password|secret|bot[_-]?token)\s*["']?\s*[:=]\s*)[^\r\n]+/gi, '$1[REDACTED]');
+    // Hide literal values only. Comparisons (===, =>) and code references such as
+    // req.body.password, process.env.KEY or getpass() stay readable for code answers.
+    .replace(/((?:api[_-]?key|access[_-]?token|password|secret|bot[_-]?token)\s*["']?\s*[:=](?![=>])[ \t]*)([^\r\n]*)/gi, (match, prefix, value) => {
+      if (!value) return match;
+      const quote = value[0];
+      if (quote === '"' || quote === "'" || quote === '`') {
+        const end = value.indexOf(quote, 1);
+        if (end === 1) return match;
+        return `${prefix}${quote}[REDACTED]${end > 0 ? value.slice(end) : ''}`;
+      }
+      // .env style (UPPER_CASE=value): always a literal, never code.
+      const envStyle = /^[A-Z0-9_-]+["']?=$/.test(prefix.trim());
+      return !envStyle && looksLikeCode(value) ? match : `${prefix}[REDACTED]`;
+    });
+}
+
+function looksLikeCode(value) {
+  if (/^(?:[[{(<$@!]|(?:new|await|function|lambda|async|typeof)\b)/.test(value)) return true;
+  // Short identifier chains and calls: req.body.password, os.environ["X"], hash(x). Long segments may be tokens.
+  if (/^[A-Za-z_$][\w$]{0,30}(?:(?:\?\.|\.)[A-Za-z_$][\w$]{0,30})*\s*[([]/.test(value)) return true;
+  if (/^[A-Za-z_$][\w$]{0,30}(?:(?:\?\.|\.)[A-Za-z_$][\w$]{0,30})+(?![\w$.-])/.test(value)) return true;
+  // Keywords, types and a variable followed by code punctuation: `password: string;`, `password = input;`.
+  if (/^(?:null|undefined|None|nil|true|false|True|False|string|number|boolean|any|str|int|bytes|Optional\b.*)\s*[;,)]?\s*$/.test(value)) return true;
+  return /^[A-Za-z_$][\w$]{0,30}\s*[;,)]/.test(value);
+}
+
+export function parseAccount(value) {
+  const invalid = () => new Error('Укажи логин GitHub или ссылку https://github.com/логин.');
+  if (typeof value !== 'string') throw invalid();
+  let login = value.trim();
+  if (/^https:\/\//i.test(login)) {
+    let url;
+    try { url = new URL(login); } catch { throw invalid(); }
+    if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com' || url.port || url.username || url.password) throw invalid();
+    login = url.pathname.replace(/^\//, '').replace(/\/$/, '');
+  }
+  login = login.replace(/^@/, '');
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(login)) throw invalid();
+  return login;
 }
 
 export function parseRepo(value, owner) {
@@ -41,7 +79,19 @@ export class GitHub {
       ...(this.token ? { Authorization: `Bearer ${this.token}` } : {})
     } }, this.fetcher);
   }
-  async repos() {
+  anonymous(owner = this.owner) {
+    return new GitHub({ owner, githubToken: '', maxFiles: this.maxFiles }, this.fetcher);
+  }
+  async profile(value) {
+    const owner = parseAccount(value);
+    const profile = await this.anonymous(owner).get(`/users/${owner}`);
+    if (typeof profile?.login !== 'string' || parseAccount(profile.login).toLowerCase() !== owner.toLowerCase()
+      || !['User', 'Organization'].includes(profile.type)) throw new Error('GitHub вернул некорректный профиль.');
+    return { login: profile.login, type: profile.type };
+  }
+  async repos(value = this.owner) {
+    const owner = parseAccount(value);
+    if (owner.toLowerCase() !== this.owner.toLowerCase()) return this.anonymous(owner).repos();
     const output = [];
     // Authenticated listing includes private repos; filter to the configured owner.
     const endpoint = this.token ? '/user/repos?affiliation=owner,collaborator,organization_member&sort=updated' : `/users/${this.owner}/repos?sort=updated`;
@@ -53,11 +103,13 @@ export class GitHub {
     throw new Error('Слишком много репозиториев для списка. Выбери проект через /repo owner/name.');
   }
   async snapshot(name) {
+    name = parseRepo(name, this.owner);
+    if (this.token && name.split('/')[0].toLowerCase() !== this.owner.toLowerCase()) return this.anonymous().snapshot(name);
     const meta = await this.get(`/repos/${name}`);
     let commit;
     try { commit = await this.get(`/repos/${name}/commits/${encodeURIComponent(meta.default_branch)}`); }
     catch (error) {
-      if (error.status === 409) return { name, sha: null, tree: [], files: [], commits: [], warnings: ['Репозиторий пуст.'] };
+      if (error.status === 409) return { name, source: 'github', isPublic: meta.private === false, sha: null, tree: [], files: [], commits: [], warnings: ['Репозиторий пуст.'] };
       throw error;
     }
     const sha = commit.sha;
@@ -86,7 +138,7 @@ export class GitHub {
     const commits = await this.get(`/repos/${name}/commits?sha=${sha}&per_page=5`);
     if (candidates.length > chosen.length) warnings.push(`Лимит индекса: ${chosen.length} из ${candidates.length} подходящих файлов.`);
     if (entries.length === 1 && /^readme(?:\.[^/]+)?$/i.test(entries[0].path)) warnings.push('В этом снимке GitHub есть только README. Файлы исходного кода не опубликованы.');
-    return { name, sha, source: 'github', branch: meta.default_branch, description: redact(meta.description || ''),
+    return { name, sha, source: 'github', isPublic: meta.private === false, branch: meta.default_branch, description: redact(meta.description || ''),
       tree: entries.map(x => x.path), files, warnings,
       commits: commits.map(x => ({ sha: x.sha.slice(0, 8), message: redact(x.commit.message.slice(0, 1000)), date: x.commit.author?.date, url: x.html_url })) };
   }
